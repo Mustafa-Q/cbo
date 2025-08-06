@@ -1,3 +1,6 @@
+from helpers import score_to_default_rate
+import random
+
 # ----------------------------
 # Loan Class
 # ----------------------------

@@ -1,3 +1,12 @@
+from typing import List
+import pandas as pd
+from collections import defaultdict
+from loan import Loan, ValuationLoan
+from copy import deepcopy
+from waterfall import Waterfall
+import numpy as np
+import numpy_financial as npf
+
 def compute_expected_tranche_npvs(tranches, reserve, loans: List[ValuationLoan], discount_rate=0.05):
 
     weeks = [2, 4, 6, 8]

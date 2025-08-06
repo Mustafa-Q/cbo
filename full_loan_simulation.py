@@ -12,7 +12,7 @@ from copy import deepcopy
 
 from loan import Loan, ValuationLoan
 from helpers import score_to_default_rate, project_loan_cashflows, aggregate_weekly_cashflows, aggregate_cashflows, simulate_tranche_waterfall, print_summary_statistics
-from statistics import calculate_summary_statistics, generate_reports, generate_security_reports
+from statistics import calculate_summary_statistics, generate_reports, generate_security_report
 from tranche import Tranche, TrancheUnit
 from valuation import compute_expected_tranche_npvs, compute_single_run_investor_metrics, compute_tranche_unit_npvs, calculate_npv_module
 from waterfall import ReserveAccount, Waterfall

@@ -1,3 +1,8 @@
+from typing import List
+import pandas as pd
+from collections import defaultdict
+from loan import Loan
+
 def calculate_summary_statistics(loans: List[Loan]):
     stats = {}
 
