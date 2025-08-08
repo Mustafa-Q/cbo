@@ -70,7 +70,13 @@ def compute_single_run_investor_metrics(tranches):
         if len(full_cashflow) < 52:
             full_cashflow += [0] * (52 - len(full_cashflow))
 
-        npv_cashflow = [ -principal ] + full_cashflow
+        # Distribute the initial investment evenly across the payment periods
+        if len(full_cashflow) > 0:
+            initial_outlays = [-principal / len(full_cashflow)] * len(full_cashflow)
+            npv_cashflow = [a + b for a, b in zip(initial_outlays, full_cashflow)]
+            npv_cashflow = [0] + npv_cashflow  # Add week 0 anchor
+        else:
+            npv_cashflow = [-principal]  # Fallback if no cashflow data
 
         # Only attempt IRR if there's at least one positive inflow
         if any(c > 0 for c in npv_cashflow[1:]):

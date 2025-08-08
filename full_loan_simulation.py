@@ -85,7 +85,7 @@ def simulate_loans(num_loans=20, seed=42):
     order_amounts = np.random.lognormal(mean=3.5, sigma=0.5, size=num_loans).round(2)
 
     # Credit scores: Normal distribution clipped to FICO range
-    credit_scores = np.random.normal(loc=680, scale=50, size=num_loans).clip(300, 850).round(0)
+    credit_scores = np.random.normal(loc=660, scale=80, size=num_loans).clip(300, 850).round(0)
 
     # Income levels: Normally distributed with bounds
     incomes = np.random.normal(loc=50000, scale=20000, size=num_loans).clip(10000, 200000).round(0)
@@ -233,7 +233,7 @@ if __name__ == "__main__":
   main()
 
 
-def run_simulation_summary(num_loans=20, discount_rates=None):
+def run_simulation_summary(num_loans=500, discount_rates=None):
     if discount_rates is None:
         discount_rates = {
             "Senior": 0.05,
