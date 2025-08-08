@@ -1,18 +1,9 @@
 from typing import List
 import pandas as pd
 from collections import defaultdict
-
-# ----------------------------
-# Default Probability Helper
-# ----------------------------
-def score_to_default_rate(score: int) -> float:
-    if score > 700:
-        return 0.02  # Higher risk
-    elif score > 650:
-        return 0.07  # Moderate risk
-    else:
-        return 0.12  # Lower risk
-
+import numpy as np
+from scipy.stats import norm
+from copula import score_to_default_rate, generate_correlated_defaults
 
 
 def project_loan_cashflows(loans, weeks, prepay_rate=0.01):
@@ -124,3 +115,23 @@ def print_summary_statistics(stats):
         print(f"   • {bucket}: {rate:.2%}")
     
     print("\n=================================================\n")
+
+
+
+
+def assign_correlated_defaults(loans, rho=0.2, seed=None):
+    """
+    Assign correlated default outcomes to each loan using Gaussian copula.
+
+    Parameters:
+        loans (list): List of Loan or ValuationLoan objects
+        rho (float): Correlation between loans
+        seed (int or None): Random seed
+    """
+    n_loans = len(loans)
+    default_probs = [score_to_default_rate(loan.credit_score) for loan in loans]
+    default_flags = generate_correlated_defaults(n_loans, default_probs, rho=rho, seed=seed)
+
+    for loan, defaulted in zip(loans, default_flags):
+        if defaulted:
+            loan.set_default()

@@ -11,11 +11,12 @@ import math
 from copy import deepcopy
 
 from loan import Loan, ValuationLoan
-from helpers import score_to_default_rate, project_loan_cashflows, aggregate_weekly_cashflows, aggregate_cashflows, simulate_tranche_waterfall, print_summary_statistics
+from helpers import project_loan_cashflows, aggregate_weekly_cashflows, aggregate_cashflows, simulate_tranche_waterfall, print_summary_statistics, assign_correlated_defaults
 from statistics import calculate_summary_statistics, generate_reports, generate_security_report
 from tranche import Tranche, TrancheUnit
 from valuation import compute_expected_tranche_npvs, compute_single_run_investor_metrics, compute_tranche_unit_npvs, calculate_npv_module
 from waterfall import ReserveAccount, Waterfall
+from copula import score_to_default_rate, generate_correlated_defaults
 
 # ----------------------------
 # Special Purpose Vehicle (SPV) Class
@@ -63,12 +64,10 @@ class SpecialPurposeVehicle:
 
 
 
-
-
 # ----------------------------
 # Main Simulation
 # ----------------------------
-def simulate_loans(num_loans=100, seed=42):
+def simulate_loans(num_loans=20, seed=42):
     """
     Generate a realistic batch of loan data for simulation.
     
@@ -123,6 +122,13 @@ def simulate_loans(num_loans=100, seed=42):
 def main():
     # 1️⃣ Generate loans
     loans_df = simulate_loans()
+
+    valuation_loans = [
+    ValuationLoan(row['loan_id'], row['order_amount'], row['credit_score'])
+        for _, row in loans_df.iterrows()
+    ]
+
+    assign_correlated_defaults(valuation_loans, rho=0.2, seed=42)
 
     df = pd.DataFrame([{
         "loan_id": row['loan_id'],
@@ -240,6 +246,8 @@ def run_simulation_summary(num_loans=20, discount_rates=None):
         ValuationLoan(row['loan_id'], row['order_amount'], row['credit_score'])
         for _, row in loans_df.iterrows()
     ]
+    from helpers import assign_correlated_defaults
+    assign_correlated_defaults(loans, rho=0.2, seed=random.randint(0, 10000))
     total_loan_pool = loans_df['order_amount'].sum()
 
     # ✅ Simulate loan payments
@@ -251,9 +259,9 @@ def run_simulation_summary(num_loans=20, discount_rates=None):
     cashflow_df = aggregate_cashflows(loans)
 
     tranche_structure = [
-        {"name": "Senior", "principal": 0.40 * total_loan_pool, "rate": 0.05},
+        {"name": "Senior", "principal": 0.50 * total_loan_pool, "rate": 0.05},
         {"name": "Mezzanine", "principal": 0.30 * total_loan_pool, "rate": 0.08},
-        {"name": "Equity", "principal": 0.30 * total_loan_pool, "rate": 0.15},
+        {"name": "Equity", "principal": 0.20 * total_loan_pool, "rate": 0.15},
     ]
 
     tranche_cashflows = simulate_tranche_waterfall(cashflow_df, tranche_structure)
@@ -264,7 +272,7 @@ def run_simulation_summary(num_loans=20, discount_rates=None):
     }
 
     num_defaults = sum(1 for loan in loans if loan.defaulted)
-    total_losses = sum(loan.remaining_balance for loan in loans if loan.defaulted)
+    total_losses = sum(loan.order_amount for loan in loans if loan.defaulted)
 
     return {
         "num_defaults": num_defaults,
@@ -298,6 +306,16 @@ if __name__ == "__main__":
     summary_df = df.drop(columns=['cashflow_df'], errors='ignore')
     print(summary_df.to_string(index=False))
 
+
+    default_counts = df["num_defaults"]
+    tail_loss_runs = sum(df["total_losses"] > 2000)
+    equity_losses = sum(df["NPV_Equity"] <= 0.01)
+
+    print("\n--- Copula Impact Summary ---")
+    print(f"Avg defaults per run: {default_counts.mean():.2f}")
+    print(f"Runs with tail losses > $2000: {tail_loss_runs}/10")
+    print(f"Equity tranche received no meaningful payout in {equity_losses}/10 runs")
+    print("\n")
 
 
 
