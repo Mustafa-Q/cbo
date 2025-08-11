@@ -7,22 +7,26 @@ from copula import score_to_default_rate, generate_correlated_defaults
 
 
 def project_loan_cashflows(loans, weeks, prepay_rate=0.01):
-    expected_cashflows = {week: 0 for week in weeks}
+    expected_cashflows = {week: 0.0 for week in weeks}
     for loan in loans:  # loans is a list of ValuationLoan objects
         prob_default = score_to_default_rate(loan.credit_score)
         survival_prob = 1.0
-    for i, week in enumerate(loan.expected_payment_schedule):
-        expected_payment = loan.installment_amount * survival_prob * (1 - prob_default - prepay_rate)
-        expected_prepay = loan.remaining_balance * survival_prob * prepay_rate if i == 0 else 0
-        expected_cashflows[week] += expected_payment + expected_prepay
-        survival_prob *= (1 - prob_default - prepay_rate)
+        for i, week in enumerate(loan.expected_payment_schedule):
+            # Skip weeks we aren't tracking
+            if week not in expected_cashflows:
+                continue
+            expected_payment = loan.installment_amount * survival_prob * (1 - prob_default - prepay_rate)
+            # Simple one-shot prepayment probability applied at the first scheduled payment
+            expected_prepay = loan.remaining_balance * survival_prob * prepay_rate if i == 0 else 0.0
+            expected_cashflows[week] += expected_payment + expected_prepay
+            survival_prob *= (1 - prob_default - prepay_rate)
     return expected_cashflows
 
 
 def aggregate_weekly_cashflows(loans, weeks=list(range(2, 20, 2))):
     weekly_cashflows = defaultdict(float)
     for week in weeks:
-        for _, row in loans_df.iterrows():  # modified for DataFrame structure
+        for loan in loans:
             payment = loan.simulate_payment(week)
             weekly_cashflows[week] += payment
     return weekly_cashflows
@@ -59,12 +63,14 @@ def aggregate_cashflows(loans: List, waterfall=None) -> pd.DataFrame:
 
 
 def simulate_tranche_waterfall(cashflow_df, tranche_structure=None):
-
     if tranche_structure is None:
+        # Fallback tranche sizes derived from total expected cash over the horizon
+        # (Only used when a structure isn't provided explicitly)
+        total_loan_pool = float(cashflow_df["cashflow"].sum())
         tranche_structure = [
-            {"name": "Senior", "principal": 1000, "rate": 0.06},
-            {"name": "Mezzanine", "principal": 500, "rate": 0.10},
-            {"name": "Equity", "principal": 0.20 * total_loan_pool, "rate": 0.15}
+            {"name": "Senior", "principal": 0.50 * total_loan_pool, "rate": 0.06},
+            {"name": "Mezzanine", "principal": 0.30 * total_loan_pool, "rate": 0.10},
+            {"name": "Equity", "principal": 0.20 * total_loan_pool, "rate": 0.15},
         ]
 
     num_weeks = len(cashflow_df)
@@ -77,25 +83,23 @@ def simulate_tranche_waterfall(cashflow_df, tranche_structure=None):
 
         for tranche in tranche_structure:
             name = tranche["name"]
+            if name == "Equity":
+                continue  # Equity is residual; pay it at the end from whatever is left
             balance = outstanding_balances[name]
-
             if balance <= 0:
                 continue
-
-            # Weekly interest payment
+            # Weekly interest payment on OUTSTANDING balance
             interest_due = balance * (rates[name] / 52)
             interest_paid = min(available_cash, interest_due)
             available_cash -= interest_paid
             weekly_cashflows[name][i] += interest_paid
-
-            # Principal payment
+            # Principal
             principal_due = balance
             principal_paid = min(available_cash, principal_due)
             available_cash -= principal_paid
             weekly_cashflows[name][i] += principal_paid
             outstanding_balances[name] -= principal_paid
 
-        # Anything left over goes to equity
         if available_cash > 0:
             weekly_cashflows["Equity"][i] += available_cash
 

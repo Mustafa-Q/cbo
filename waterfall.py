@@ -52,6 +52,10 @@ class Waterfall:
 
         available_cash = cash
 
+        # Initialize tranche payment tracking to 0 for all tranches
+        for t in self.tranches:
+            record['tranche_payments'][t.name] = 0
+
         # Step 1: Draw from reserve if needed
         if available_cash < 0:
             shortfall = abs(available_cash)
@@ -60,25 +64,30 @@ class Waterfall:
             available_cash += draw_amount
             record['reserve_draw'] = draw_amount
 
-        # Step 2: Sequentially pay tranches
+        # Step 2: Sequentially pay tranches (skip Equity here; Equity is residual)
         for tranche in self.tranches:
+            if tranche.name == 'Equity':
+                continue
             if available_cash <= 0:
                 break
             paid = tranche.apply_payment(available_cash, week=week)
             available_cash -= paid
-            record['tranche_payments'][tranche.name] = paid
+            record['tranche_payments'][tranche.name] += paid
 
+        # Step 3: Top up reserve to target BEFORE paying equity residual (policy choice)
+        if available_cash > 0 and self.reserve is not None:
+            reserve_needed = max(0, self.reserve.target - self.reserve.balance)
+            reserve_top_up = min(available_cash, reserve_needed)
+            self.reserve.balance += reserve_top_up
+            available_cash -= reserve_top_up
+            record['reserve_top_up'] = reserve_top_up
+
+        # Step 4: Pay any remaining residual to Equity
         if available_cash > 0:
-            record['tranche_payments']['Equity'] = (record['tranche_payments'].get('Equity', 0) + available_cash)
+            record['tranche_payments']['Equity'] = record['tranche_payments'].get('Equity', 0) + available_cash
             available_cash = 0
 
-        # Step 3: Top up reserve if there's leftover cash
-        reserve_top_up = min(available_cash, self.reserve.target - self.reserve.balance)
-        self.reserve.balance += reserve_top_up
-        available_cash -= reserve_top_up
-        record['reserve_top_up'] = reserve_top_up
-
-        # Step 4: Record remaining values
+        # Step 5: Record remaining values
         record['leftover_cash'] = available_cash
         record['reserve_balance_end'] = self.reserve.balance
 

@@ -8,9 +8,9 @@ def score_to_default_rate(score: int) -> float:
     if score > 700:
         return 0.02  
     elif score > 650:
-        return 0.05  
+        return 0.03  
     else:
-        return 0.08  
+        return 0.05  
 
 # ----------------------------
 # Correlated Default Generator

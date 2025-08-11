@@ -18,6 +18,37 @@ from valuation import compute_expected_tranche_npvs, compute_single_run_investor
 from waterfall import ReserveAccount, Waterfall
 from copula import score_to_default_rate, generate_correlated_defaults
 
+import numpy as np
+import numpy_financial as npf
+
+def monte_carlo_tranche_npvs(loans_df, tranche_structure, rho=0.07, discount_rates=None, n_paths=200):
+    """Price tranches by Monte Carlo using the SAME mechanics as realized path."""
+    from helpers import aggregate_cashflows, simulate_tranche_waterfall, assign_correlated_defaults
+    from loan import ValuationLoan
+    import random
+
+    if discount_rates is None:
+        discount_rates = {"Senior": 0.05, "Mezzanine": 0.08, "Equity": 0.15}
+
+    tranche_names = [t["name"] for t in tranche_structure]
+    sums = {name: 0.0 for name in tranche_names}
+
+    for _ in range(n_paths):
+        loans = [
+            ValuationLoan(row['loan_id'], row['order_amount'], row['credit_score'])
+            for _, row in loans_df.iterrows()
+        ]
+        assign_correlated_defaults(loans, rho=rho, seed=random.randint(0, 10**9))
+        for week in [2, 4, 6, 8]:
+            for loan in loans:
+                loan.simulate_payment(week)
+        cashflow_df = aggregate_cashflows(loans)
+        tranche_cf = simulate_tranche_waterfall(cashflow_df, tranche_structure)
+        for name, cf in tranche_cf.items():
+            sums[name] += float(npf.npv(discount_rates[name]/52.0, cf))
+
+    return {name: sums[name] / n_paths for name in tranche_names}
+
 # ----------------------------
 # Special Purpose Vehicle (SPV) Class
 # ----------------------------
@@ -67,7 +98,7 @@ class SpecialPurposeVehicle:
 # ----------------------------
 # Main Simulation
 # ----------------------------
-def simulate_loans(num_loans=20, seed=42):
+def simulate_loans(num_loans=20):
     """
     Generate a realistic batch of loan data for simulation.
     
@@ -78,7 +109,7 @@ def simulate_loans(num_loans=20, seed=42):
     Returns:
         pd.DataFrame: DataFrame containing the simulated loan data.
     """
-    np.random.seed(seed)
+    #np.random.seed(seed)
     #random.seed(seed)
 
     # Order amount: log-normal for skewed purchase sizes
@@ -128,7 +159,7 @@ def main():
         for _, row in loans_df.iterrows()
     ]
 
-    assign_correlated_defaults(valuation_loans, rho=0.2, seed=42)
+    assign_correlated_defaults(valuation_loans, rho=0.07, seed=42)
 
     df = pd.DataFrame([{
         "loan_id": row['loan_id'],
@@ -138,39 +169,44 @@ def main():
 
     total_loan_pool = df["order_amount"].sum()
 
-    # 2️⃣ Setup tranches and reserve
-    tranches = [
-        Tranche(name="Senior", principal=0.50 * total_loan_pool, priority=1),
-        Tranche(name="Mezzanine", principal=0.30 * total_loan_pool, priority=2),
-        Tranche(name="Equity", principal=0.20 * total_loan_pool, priority=3),
+    tranche_structure = [
+        {"name": "Senior", "principal": 0.40 * total_loan_pool, "rate": 0.05},
+        {"name": "Mezzanine", "principal": 0.30 * total_loan_pool, "rate": 0.08},
+        {"name": "Equity", "principal": 0.30 * total_loan_pool, "rate": 0.15},
     ]
-    reserve = ReserveAccount(target=0.05 * total_loan_pool)
+    discount_rates = {"Senior": 0.05, "Mezzanine": 0.08, "Equity": 0.15}
 
-    # 3️⃣ Valuation NPVs (model-predicted)
-    valuation_loans = [ValuationLoan(row['loan_id'], row['order_amount'], row['credit_score']) 
-                       for _, row in loans_df.iterrows()]
-    true_npvs = compute_expected_tranche_npvs(tranches, reserve, valuation_loans)
+    true_npvs = monte_carlo_tranche_npvs(loans_df, tranche_structure, rho=0.07, discount_rates=discount_rates, n_paths=200)
 
     print("\n--- True Projected NPVs (Separated Valuation) ---")
     for t_name, npv in true_npvs.items():
         print(f"{t_name}: {npv:.2f}")
 
-    # 4️⃣ Setup SPV and cashflow projection
-    spv = SpecialPurposeVehicle(valuation_loans, tranches, reserve)
+    tranches = [
+        Tranche(name="Senior", principal=tranche_structure[0]["principal"], priority=1),
+        Tranche(name="Mezzanine", principal=tranche_structure[1]["principal"], priority=2),
+        Tranche(name="Equity", principal=tranche_structure[2]["principal"], priority=3),
+    ]
+    reserve = ReserveAccount(target=0.0)
 
-    # ✅ Aggregate all cashflows directly (no weeks argument needed), include waterfall for equity
-    all_cashflows = aggregate_cashflows(spv.loans, waterfall=spv.waterfall)
+    # 3️⃣ Valuation NPVs (model-predicted)
+    valuation_loans = [ValuationLoan(row['loan_id'], row['order_amount'], row['credit_score']) 
+                       for _, row in loans_df.iterrows()]
 
-    weeks = [2, 4, 6, 8]  # Standard biweekly schedule
-    
-    # 5️⃣ Projected tranche NPVs (initial pricing)
-    projected_npvs = compute_expected_tranche_npvs(tranches, reserve, valuation_loans)
+    projected_npvs = monte_carlo_tranche_npvs(loans_df, tranche_structure, rho=0.07, discount_rates=discount_rates, n_paths=200)
     print("\n--- Projected Tranche NPVs ---")
     for name, npv in projected_npvs.items():
         print(f"{name}: {npv:.2f}")
 
+    # 4️⃣ Setup SPV and cashflow projection
+    spv = SpecialPurposeVehicle(valuation_loans, tranches, reserve)
+
+    weeks = [2, 4, 6, 8]  # Standard biweekly schedule
+
     # 6️⃣ Run the actual simulation
     spv.simulate_all_payments()
+
+    # ✅ Aggregate all cashflows AFTER the simulation has generated them
     metrics_df = compute_single_run_investor_metrics(spv.tranches)
     print("\n--- Tranche Investor Metrics ---")
     print(metrics_df.to_string(index=False))
@@ -185,13 +221,11 @@ def main():
         row["order_amount"] * score_to_default_rate(row["credit_score"])
         for _, row in loan_df.iterrows()
     )
+
     # Sum up equity payments from waterfall history
-    equity_from_waterfall = sum(
-        amt for record in spv.waterfall.history
-        for name, amt in record.get('tranche_payments', {}).items() if name == 'Equity'
-    )
-    total_collected = all_cashflows["cashflow"].sum() + equity_from_waterfall
-    realized_loss = loan_df["order_amount"].sum() - total_collected
+    all_cashflows = aggregate_cashflows(spv.loans)
+    total_collected = float(all_cashflows["cashflow"].sum())
+    realized_loss = float(loan_df["order_amount"].sum()) - total_collected
 
     # 9️⃣ Run NPV calculation for entire loan pool
     npv_output = calculate_npv_module(
@@ -246,8 +280,9 @@ def run_simulation_summary(num_loans=500, discount_rates=None):
         ValuationLoan(row['loan_id'], row['order_amount'], row['credit_score'])
         for _, row in loans_df.iterrows()
     ]
+
     from helpers import assign_correlated_defaults
-    assign_correlated_defaults(loans, rho=0.2, seed=random.randint(0, 10000))
+    assign_correlated_defaults(loans, rho=0.07, seed=random.randint(0, 10000))
     total_loan_pool = loans_df['order_amount'].sum()
 
     # ✅ Simulate loan payments
@@ -259,9 +294,9 @@ def run_simulation_summary(num_loans=500, discount_rates=None):
     cashflow_df = aggregate_cashflows(loans)
 
     tranche_structure = [
-        {"name": "Senior", "principal": 0.50 * total_loan_pool, "rate": 0.05},
+        {"name": "Senior", "principal": 0.40 * total_loan_pool, "rate": 0.05},
         {"name": "Mezzanine", "principal": 0.30 * total_loan_pool, "rate": 0.08},
-        {"name": "Equity", "principal": 0.20 * total_loan_pool, "rate": 0.15},
+        {"name": "Equity", "principal": 0.30 * total_loan_pool, "rate": 0.15},
     ]
 
     tranche_cashflows = simulate_tranche_waterfall(cashflow_df, tranche_structure)
@@ -306,16 +341,33 @@ if __name__ == "__main__":
     summary_df = df.drop(columns=['cashflow_df'], errors='ignore')
     print(summary_df.to_string(index=False))
 
-
     default_counts = df["num_defaults"]
     tail_loss_runs = sum(df["total_losses"] > 2000)
-    equity_losses = sum(df["NPV_Equity"] <= 0.01)
+    threshold = 1.0  # treat <= $1 as negligible; tweak as you like
+    paid_runs = int((df["NPV_Equity"] > threshold).sum())
+    zero_runs = len(df) - paid_runs
 
     print("\n--- Copula Impact Summary ---")
     print(f"Avg defaults per run: {default_counts.mean():.2f}")
-    print(f"Runs with tail losses > $2000: {tail_loss_runs}/10")
-    print(f"Equity tranche received no meaningful payout in {equity_losses}/10 runs")
+    print(f"Runs with tail losses > $2000: {tail_loss_runs}/{len(df)}")
+    print(f"Equity paid meaningfully (> ${threshold:.0f}) in {paid_runs}/{len(df)} runs; "f"negligible in {zero_runs}/{len(df)} runs.")
     print("\n")
 
+    # --- Risk Metrics (MC) ---
+    equity_wipe_threshold = 1.0  # treat <= $1 NPV as wiped; tweak if needed
 
+    # Probability equity is wiped
+    p_equity_wiped = float((df["NPV_Equity"] <= equity_wipe_threshold).mean())
 
+    # Loss percentiles (P50 / P95) and Expected Shortfall at 95%
+    losses = df["total_losses"].to_numpy(dtype=float)
+    p50_loss = float(np.percentile(losses, 50))
+    p95_loss = float(np.percentile(losses, 95))
+    es95_loss = float(losses[losses >= p95_loss].mean()) if (losses >= p95_loss).any() else p95_loss
+
+    print("--- Risk Metrics ---")
+    print(f"P(Equity wiped) (NPV_Equity <= ${equity_wipe_threshold:.0f}): {p_equity_wiped:.2%}")
+    print(f"Portfolio loss P50: ${p50_loss:,.2f}")
+    print(f"Portfolio loss P95: ${p95_loss:,.2f}")
+    print(f"Expected shortfall (>= P95): ${es95_loss:,.2f}")
+    print("\n")

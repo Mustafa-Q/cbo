@@ -47,52 +47,68 @@ def compute_expected_tranche_npvs(tranches, reserve, loans: List[ValuationLoan],
 
 
 def compute_single_run_investor_metrics(tranches):
+    """
+    Build per-tranche investor metrics with:
+    - upfront-outlay IRR convention ([-principal] + inflows)
+    - automatic annualization based on inferred cashflow frequency
+    """
     results = []
 
     for tranche in tranches:
         principal = tranche.principal
-        total_received = 0
-        full_cashflow = []
+        total_received = 0.0
 
-        # Build a list of total payments per week across all units
+        # Collect total payments per week across all units
+        full_cashflow = []
         max_week = 0
+        all_weeks = []
+
         for unit in tranche.units:
             for week, amount in unit.cashflow_history.items():
+                # grow list to accommodate week index
                 while len(full_cashflow) <= week:
-                    full_cashflow.append(0)
-                full_cashflow[week] += amount
+                    full_cashflow.append(0.0)
+                full_cashflow[week] += float(amount)
                 max_week = max(max_week, week)
+                all_weeks.append(int(week))
 
-        full_cashflow = full_cashflow[:max_week + 1]
+        # Trim trailing zeros to last week with activity
+        full_cashflow = full_cashflow[:max_week + 1] if max_week >= 0 else []
 
-        # Construct IRR-style cashflow: initial outlay negative, then inflows
-        # Pad to a full year (optional but safer)
-        if len(full_cashflow) < 52:
-            full_cashflow += [0] * (52 - len(full_cashflow))
+        # ---- infer frequency for annualization ----
+        # If we have explicit week indices, infer period length from gaps; else heuristic:
+        if len(all_weeks) >= 2:
+            sorted_w = sorted(set(all_weeks))
+            gaps = [j - i for i, j in zip(sorted_w[:-1], sorted_w[1:]) if (j - i) > 0]
+            period_weeks = min(gaps) if gaps else 2  # default biweekly if all same week
+            freq_per_year = 52.0 / float(period_weeks)
+        else:
+            # Heuristic: if exactly four nonzero periods, likely 8-week/biweekly => 26 per year
+            nonzero_periods = sum(1 for x in full_cashflow if abs(x) > 1e-9)
+            if nonzero_periods == 4:
+                freq_per_year = 26.0
+            else:
+                freq_per_year = 52.0  # weekly fallback
 
-        # Distribute the initial investment evenly across the payment periods
+        # ---- IRR as true upfront outlay then inflows ----
         if len(full_cashflow) > 0:
-            initial_outlays = [-principal / len(full_cashflow)] * len(full_cashflow)
-            npv_cashflow = [a + b for a, b in zip(initial_outlays, full_cashflow)]
-            npv_cashflow = [0] + npv_cashflow  # Add week 0 anchor
+            irr_cashflow = [-float(principal)] + list(full_cashflow)
         else:
-            npv_cashflow = [-principal]  # Fallback if no cashflow data
+            irr_cashflow = [-float(principal)]
 
-        # Only attempt IRR if there's at least one positive inflow
-        if any(c > 0 for c in npv_cashflow[1:]):
-            try:
-                biweekly_irr = npf.irr(npv_cashflow)
-                annual_irr = (1 + biweekly_irr) ** 26 - 1 if biweekly_irr is not None else None
-            except:
-                biweekly_irr = None
-                annual_irr = None
-        else:
-            biweekly_irr = None
+        # Compute periodic IRR; annualize by compounding freq_per_year periods
+        annual_irr = None
+        try:
+            if any(c > 0 for c in irr_cashflow[1:]):
+                periodic_irr = npf.irr(irr_cashflow)
+                if periodic_irr is not None:
+                    annual_irr = (1.0 + periodic_irr) ** float(freq_per_year) - 1.0
+        except Exception:
             annual_irr = None
 
-        total_received = sum(full_cashflow)
-        cash_on_cash = total_received / principal if principal > 0 else 0
-        loss_severity = max(0, (principal - total_received) / principal)
+        total_received = float(sum(full_cashflow))
+        cash_on_cash = (total_received / principal) if principal > 0 else 0.0
+        loss_severity = max(0.0, (principal - total_received) / principal) if principal > 0 else 0.0
 
         results.append({
             "Tranche": tranche.name,
@@ -138,35 +154,61 @@ def calculate_npv_module(cashflows_df, loans, annual_discount_rates=None, expect
     """
     Calculates Net Present Value (NPV) for all loan cashflows combined.
     Includes initial loan disbursement as a negative cashflow.
+    Robust to missing/empty cashflow columns by reconstructing from loans' cashflow_history.
     """
     if annual_discount_rates is None:
         annual_discount_rates = [0.05, 0.10, 0.15]
 
-    weeks_per_year = 52
-    weekly_rates = [(1 + rate)**(1/weeks_per_year) - 1 for rate in annual_discount_rates]
+    # Try to read a cashflow column, fallback to reconstruction from loans
+    cash_col = None
+    if isinstance(cashflows_df, pd.DataFrame):
+        for candidate in ("cashflow", "payment", "cashflows", "amount"):
+            if candidate in cashflows_df.columns:
+                cash_col = candidate
+                break
 
-    total_cashflows = cashflows_df['cashflow'].values
-    
-    # Add initial outflow (principal disbursed)
-    total_principal = -sum(loan.order_amount for loan in loans)
-    adjusted_cashflows = np.insert(total_cashflows, 0, total_principal)
+    use_df = False
+    if cash_col is not None:
+        arr = cashflows_df[cash_col].astype(float).values
+        use_df = bool(arr.size) and (abs(arr).sum() > 1e-9)
+    else:
+        arr = np.array([], dtype=float)
 
+    if not use_df:
+        # Rebuild weekly flows from each loan's cashflow_history
+        weekly = defaultdict(float)
+        for loan in loans:
+            history = getattr(loan, "cashflow_history", None)
+            if history:
+                for week, amt in history.items():
+                    weekly[int(week)] += float(amt)
+        if weekly:
+            max_week = max(weekly.keys())
+            arr = np.zeros(max_week + 1, dtype=float)
+            for w, amt in weekly.items():
+                arr[int(w)] = amt
+        else:
+            arr = np.array([0.0], dtype=float)
+
+    # Insert initial outflow at t=0
+    total_principal = -float(sum(getattr(loan, "order_amount", 0.0) for loan in loans))
+    adjusted = np.insert(arr, 0, total_principal).astype(float)
+
+    # Discount with weekly-compounded rates
     npv_results = {}
-    for rate, annual_rate in zip(weekly_rates, annual_discount_rates):
-        npv_results[f"{int(annual_rate*100)}%"] = npf.npv(rate, adjusted_cashflows)
+    for annual_rate in annual_discount_rates:
+        weekly_rate = (1.0 + annual_rate) ** (1.0 / 52.0) - 1.0
+        npv_results[f"{int(annual_rate * 100)}%"] = float(npf.npv(weekly_rate, adjusted))
 
     loss_comparison = None
     if expected_loss is not None and realized_loss is not None:
         loss_comparison = {
-            'expected_loss': expected_loss,
-            'realized_loss': realized_loss,
-            'difference': expected_loss - realized_loss
+            "expected_loss": expected_loss,
+            "realized_loss": realized_loss,
+            "difference": expected_loss - realized_loss,
         }
 
-    return {
-        "NPV_Results": npv_results,
-        "Loss_Comparison": loss_comparison
-    }
+    return {"NPV_Results": npv_results, "Loss_Comparison": loss_comparison}
 
 
 # --------------------------
