@@ -21,6 +21,124 @@ from copula import score_to_default_rate, generate_correlated_defaults
 import numpy as np
 import numpy_financial as npf
 
+from scipy.stats import norm
+
+def annual_to_horizon_pd(pd_annual: float, horizon_years: float) -> float:
+    """Convert annual PD to a horizon PD assuming independent hazard over time."""
+    return 1.0 - (1.0 - pd_annual) ** horizon_years
+
+def weekly_hazard_from_horizon_pd(horizon_pd: float, horizon_weeks: int) -> float:
+    """
+    Solve for a constant weekly hazard p such that:
+    1 - (1 - p)**horizon_weeks = horizon_pd  =>  p = 1 - (1 - horizon_pd)**(1/horizon_weeks)
+    """
+    horizon_pd = float(np.clip(horizon_pd, 1e-12, 1 - 1e-12))
+    return 1.0 - (1.0 - horizon_pd) ** (1.0 / horizon_weeks)
+
+def assign_correlated_default_times_hybrid(
+    loans: List[ValuationLoan],
+    rho: float = 0.07,
+    seed: int = 42,
+    due_weeks: tuple = (2, 4, 6, 8),
+    horizon_weeks: int = 8,
+    due_hazard_multiplier: float = 1.5,
+) -> None:
+    rng = np.random.default_rng(seed)
+    n = len(loans)
+    if not (0.0 <= rho < 1.0):
+        raise ValueError("rho must be in [0,1).")
+
+    # Common/Systematic factor and idiosyncratic shocks
+    M = rng.standard_normal()
+    eps = rng.standard_normal(n)
+    z = np.sqrt(rho) * M + np.sqrt(1.0 - rho) * eps
+    U = norm.cdf(z)  # Copula uniforms in (0,1)
+
+    # For placing the event within the selected week
+    U_within = rng.random(n)
+
+    horizon_years = horizon_weeks / 52.0
+    due_set = set(due_weeks)
+
+    # Ensure the multiplier keeps hazards positive on "other" weeks
+    m = float(due_hazard_multiplier)
+
+    if not (0.0 < m < 2.0):
+        raise ValueError("due_hazard_multiplier must be in (0,2) so that p_other remains positive.")
+
+    for i, loan in enumerate(loans):
+        # Map score -> annual PD (provided by existing project util)
+        pd_ann = float(score_to_default_rate(getattr(loan, "credit_score", None)))
+        # Convert to horizon PD and then base weekly hazard
+        pd_hor = annual_to_horizon_pd(pd_ann, horizon_years)
+        p_base = weekly_hazard_from_horizon_pd(pd_hor, horizon_weeks)
+
+        # Two-level weekly hazards; clip to a sensible range
+        p_due = np.clip(m * p_base, 1e-9, 1 - 1e-6)
+        p_other = np.clip((2.0 - m) * p_base, 1e-9, 1 - 1e-6)
+
+        weekly_haz = []
+        for w in range(1, horizon_weeks + 1):
+            weekly_haz.append(p_due if w in due_set else p_other)
+
+        # Discrete inverse-transform using U[i]
+        S = 1.0  # survival prior to week 1
+        default_week = None
+        for w, p_w in enumerate(weekly_haz, start=1):
+            if U[i] <= (1.0 - (S * (1.0 - p_w))):
+                default_week = w
+                break
+            S *= (1.0 - p_w)
+
+        if default_week is None:
+            # Survived the horizon
+            loan.default_time_week_continuous = float("inf")
+            loan.default_week = None
+            loan.default_scheduled_week_to_pay = None
+            continue
+
+        # Place the default uniformly within the selected week
+        t_cont = (default_week - 1) + U_within[i]
+        loan.default_time_week_continuous = float(t_cont)
+        loan.default_week = int(default_week)
+
+        # For BNPL payment logic: snap to the *next* payment week >= t_cont
+        next_pay_weeks = [w for w in due_weeks if w >= t_cont - 1e-9]
+        loan.default_scheduled_week_to_pay = int(next_pay_weeks[0]) if next_pay_weeks else None
+
+
+
+# Local aggregator: build weekly pool cashflows from each loan's recorded payments
+def aggregate_cashflows_local(loans, horizon_weeks: int = 8) -> pd.DataFrame:
+    from collections import defaultdict
+    totals = defaultdict(float)
+    for loan in loans:
+        pr = getattr(loan, "payment_record", {})
+        if isinstance(pr, dict):
+            for w, amt in pr.items():
+                try:
+                    w_int = int(w)
+                except Exception:
+                    continue
+                totals[w_int] += float(amt)
+    # Ensure biweekly schedule rows exist (2,4,6,8) with zeros if missing
+    schedule = [2, 4, 6, 8] if horizon_weeks >= 8 else [w for w in [2,4,6,8] if w <= horizon_weeks]
+    rows = []
+    for w in schedule:
+        rows.append((w, float(totals.get(w, 0.0))))
+    # Also include any extra weeks found in totals (sorted) that are not in schedule
+    extra_weeks = sorted([w for w in totals.keys() if w not in schedule])
+    for w in extra_weeks:
+        rows.append((w, float(totals[w])))
+    if not rows:
+        return pd.DataFrame({"week": [], "cashflow": [], "total_payment": [], "amount": []})
+    rows = sorted(rows, key=lambda x: x[0])
+    df = pd.DataFrame(rows, columns=["week", "cashflow"])
+    # Provide redundant column names for downstream compatibility
+    df["total_payment"] = df["cashflow"]
+    df["amount"] = df["cashflow"]
+    return df
+
 def monte_carlo_tranche_npvs(loans_df, tranche_structure, rho=0.07, discount_rates=None, n_paths=200):
     """Price tranches by Monte Carlo using the SAME mechanics as realized path."""
     from helpers import aggregate_cashflows, simulate_tranche_waterfall, assign_correlated_defaults
@@ -38,16 +156,19 @@ def monte_carlo_tranche_npvs(loans_df, tranche_structure, rho=0.07, discount_rat
             ValuationLoan(row['loan_id'], row['order_amount'], row['credit_score'])
             for _, row in loans_df.iterrows()
         ]
-        assign_correlated_defaults(loans, rho=rho, seed=random.randint(0, 10**9))
+        
+        assign_correlated_default_times_hybrid(loans, rho=rho, seed=random.randint(0, 10**9), due_hazard_multiplier=1.5)
+
         for week in [2, 4, 6, 8]:
             for loan in loans:
                 loan.simulate_payment(week)
-        cashflow_df = aggregate_cashflows(loans)
+        cashflow_df = aggregate_cashflows_local(loans)
         tranche_cf = simulate_tranche_waterfall(cashflow_df, tranche_structure)
         for name, cf in tranche_cf.items():
             sums[name] += float(npf.npv(discount_rates[name]/52.0, cf))
 
     return {name: sums[name] / n_paths for name in tranche_names}
+
 
 # ----------------------------
 # Special Purpose Vehicle (SPV) Class
@@ -91,7 +212,6 @@ class SpecialPurposeVehicle:
                 cashflows[week] += payment
 
             weekly_total_payment = cashflows[week]
-
 
 
 
@@ -159,7 +279,7 @@ def main():
         for _, row in loans_df.iterrows()
     ]
 
-    assign_correlated_defaults(valuation_loans, rho=0.07, seed=42)
+    assign_correlated_default_times_hybrid(valuation_loans, rho=0.7, seed=42, due_hazard_multiplier=1.5)
 
     df = pd.DataFrame([{
         "loan_id": row['loan_id'],
@@ -190,8 +310,8 @@ def main():
     reserve = ReserveAccount(target=0.0)
 
     # 3️⃣ Valuation NPVs (model-predicted)
-    valuation_loans = [ValuationLoan(row['loan_id'], row['order_amount'], row['credit_score']) 
-                       for _, row in loans_df.iterrows()]
+    #valuation_loans = [ValuationLoan(row['loan_id'], row['order_amount'], row['credit_score']) 
+    #                   for _, row in loans_df.iterrows()]
 
     projected_npvs = monte_carlo_tranche_npvs(loans_df, tranche_structure, rho=0.07, discount_rates=discount_rates, n_paths=200)
     print("\n--- Projected Tranche NPVs ---")
@@ -223,7 +343,7 @@ def main():
     )
 
     # Sum up equity payments from waterfall history
-    all_cashflows = aggregate_cashflows(spv.loans)
+    all_cashflows = aggregate_cashflows_local(spv.loans)
     total_collected = float(all_cashflows["cashflow"].sum())
     realized_loss = float(loan_df["order_amount"].sum()) - total_collected
 
@@ -282,7 +402,9 @@ def run_simulation_summary(num_loans=500, discount_rates=None):
     ]
 
     from helpers import assign_correlated_defaults
-    assign_correlated_defaults(loans, rho=0.07, seed=random.randint(0, 10000))
+
+    assign_correlated_default_times_hybrid(loans, rho=0.07, seed=random.randint(0, 10000), due_hazard_multiplier=1.5)
+    
     total_loan_pool = loans_df['order_amount'].sum()
 
     # ✅ Simulate loan payments
@@ -291,7 +413,7 @@ def run_simulation_summary(num_loans=500, discount_rates=None):
             loan.simulate_payment(week)
 
     # ✅ Aggregate cashflows after simulation
-    cashflow_df = aggregate_cashflows(loans)
+    cashflow_df = aggregate_cashflows_local(loans)
 
     tranche_structure = [
         {"name": "Senior", "principal": 0.40 * total_loan_pool, "rate": 0.05},

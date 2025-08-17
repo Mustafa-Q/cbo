@@ -78,10 +78,10 @@ class Loan:
 
                         recovery_rate = 0.30  # 30% recovery of remaining balance
                         recovery_amount = self.remaining_balance * recovery_rate
-    
+
                         self.remaining_balance = 0  # Loan is written off
                         self.payment_record[week] = self.payment_record.get(week, 0) + recovery_amount
-    
+
                         return total_payment + recovery_amount
 
             else:
@@ -97,82 +97,85 @@ class Loan:
 
 
 class ValuationLoan:
-    def __init__(self, loan_id, order_amount, credit_score, externally_defaulted=None):
-        self.loan_id = loan_id
-        self.order_amount = order_amount
-        self.credit_score = credit_score
+    def __init__(self, loan_id, order_amount, credit_score):
+        self.loan_id = int(loan_id)
+        self.order_amount = float(order_amount)
+        self.credit_score = int(credit_score)
+        self.payment_record = {}
+        self.paid_weeks = []
+        self.late_weeks = []
+        self.total_late_fees_paid = 0.0
 
-        self.remaining_balance = order_amount
-        self.installment_amount = order_amount / 4
-        self.expected_payment_schedule = [2, 4, 6, 8]
-
+        # State
+        self.remaining_balance = float(order_amount)
         self.defaulted = False
         self.prepaid = False
-        self.late_weeks = []
-        self.paid_weeks = []
-        self.total_late_fees_paid = 0
-        self.payment_record = {}  # ✅ use dict for easier aggregation
-        self.externally_defaulted = externally_defaulted
 
-    def expected_cashflows(self, prepay_rate=0.01):
-        prob_default = score_to_default_rate(self.credit_score)
-        survival_prob = 1.0
-        cashflows = {}
+        # NEW: populated by assign_correlated_default_times_hybrid(...)
+        self.default_time_week_continuous = float("inf")
+        self.default_week = None
+        self.default_scheduled_week_to_pay = None  # next due week >= default time
 
-        for i, week in enumerate(self.expected_payment_schedule):
-            expected_payment = self.installment_amount * survival_prob * (1 - prob_default - prepay_rate)
-            expected_prepay = self.remaining_balance * survival_prob * prepay_rate if i == 0 else 0
-            cashflows[week] = expected_payment + expected_prepay
-            survival_prob *= (1 - prob_default - prepay_rate)
+        # Payment schedule
+        self.payment_weeks = (2, 4, 6, 8)
+        self.installment = self.order_amount / 4.0
 
-        return cashflows
+        # Optional accounting
+        self.late_fees_collected = 0.0
+        self.cash_collected = 0.0
 
-    def set_default(self):
-        self.defaulted = True
-        self.remaining_balance = 0
+    def _trigger_default_if_due(self, week: int) -> None:
+        """
+        If a default has been scheduled and we've reached (or passed) the
+        next due week associated with that default, mark the loan defaulted.
+        """
+        if self.defaulted:
+            return
+        # If we have a scheduled next payment week tied to the default time:
+        if self.default_scheduled_week_to_pay is not None:
+            if week >= self.default_scheduled_week_to_pay:
+                self.defaulted = True
 
-    def simulate_payment(self, week):
-        if self.defaulted or self.prepaid or self.remaining_balance <= 0:
-            return 0
+    def simulate_payment(self, week: int) -> float:
+        """
+        Called by the engine each week. We only actually pay on due weeks.
+        If a default has occurred by or before the due week, pay nothing.
+        """
+        # Idempotent: don't double-pay a week
+        if week in self.payment_record:
+            return 0.0
 
-        if self.externally_defaulted:
-            self.set_default()
-            return 0
+        # Already defaulted -> no cash
+        if self.defaulted:
+            return 0.0
 
-        # Default logic
-        prob_default = score_to_default_rate(self.credit_score)
-        if random.random() < prob_default:
+        # Only act on BNPL due weeks
+        if week not in self.payment_weeks:
+            return 0.0
+
+        # Trigger default if the hybrid model scheduled default at/ before this due week
+        if self.default_scheduled_week_to_pay is not None and week >= self.default_scheduled_week_to_pay:
             self.defaulted = True
-            
-            recovery_rate = 0.30
-            recovery_amount = self.remaining_balance * recovery_rate
-            self.remaining_balance = 0
-            self.payment_record[week] = recovery_amount
-    
-            return recovery_amount
+            return 0.0
 
-        # Prepayment logic
-        if random.random() < 0.08:
-            self.prepaid = True
-            payment = self.remaining_balance
-            self.remaining_balance = 0
+        # Make the scheduled payment
+        pay = float(min(self.installment, self.remaining_balance))
+        if pay <= 0.0:
+            return 0.0
+
+        self.remaining_balance -= pay
+        self.cash_collected += pay
+        self.payment_record[week] = pay
+        if week not in self.paid_weeks:
             self.paid_weeks.append(week)
-            self.payment_record[week] = payment
-            return payment
 
-        # Late payment logic
-        if random.random() < 0.2:
-            self.late_weeks.append(week)
-            self.total_late_fees_paid += 5
-            self.payment_record[week] = 0
-            return 0
+        # Mark prepaid if fully paid
+        if self.remaining_balance <= 1e-8:
+            self.prepaid = True
 
-        # ✅ Normal installment payment
-        payment = min(self.installment_amount, self.remaining_balance)
-        self.remaining_balance -= payment
-        self.paid_weeks.append(week)
-        self.payment_record[week] = payment
-        return payment
+        return pay
+
+
 
 def generate_correlated_defaults(n_loans, default_probs, rho=0.2, seed=None):
     """
