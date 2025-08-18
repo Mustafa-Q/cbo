@@ -8,6 +8,27 @@ from waterfall import Waterfall
 import numpy as np
 import numpy_financial as npf
 
+# ----- Expected loss helper (horizon-adjusted PD * LGD) -----
+def _expected_loss_horizon(loans, lgd_assumption: float = 0.70, horizon_weeks: int = 8) -> float:
+    """Compute expected loss over the BNPL horizon using annual PDs mapped to
+    horizon PDs and a constant LGD assumption consistent with simulation.
+    EL = sum(EAD * PD_horizon * LGD).
+    """
+    from copula import score_to_default_rate  # local import to avoid cycles
+    years = float(horizon_weeks) / 52.0
+    total_el = 0.0
+    for l in loans:
+        ead = float(getattr(l, "order_amount", 0.0))
+        cs = getattr(l, "credit_score", None)
+        try:
+            pd_ann = float(score_to_default_rate(cs))
+        except Exception:
+            pd_ann = 0.0
+        pd_ann = max(0.0, min(pd_ann, 1.0))
+        pd_h = 1.0 - (1.0 - pd_ann) ** years
+        total_el += ead * pd_h * float(lgd_assumption)
+    return float(total_el)
+
 def compute_expected_tranche_npvs(tranches, reserve, loans: List[ValuationLoan], discount_rate=0.05):
 
     weeks = [2, 4, 6, 8]
@@ -56,6 +77,46 @@ def compute_single_run_investor_metrics(tranches):
 
     for tranche in tranches:
         principal = tranche.principal
+
+        # Prefer tranche-level cashflows if present (works for both SPV & MC paths)
+        cf_attr = getattr(tranche, "cashflows", None)
+        if isinstance(cf_attr, (list, tuple)) and any(abs(x) > 1e-12 for x in cf_attr):
+            full_cashflow = list(cf_attr)
+
+            # Infer payment frequency (weeks) from nonzero gaps for annualization
+            nonzero_idx = [i for i, a in enumerate(full_cashflow) if abs(a) > 1e-9]
+            if len(nonzero_idx) >= 2:
+                gaps = [j - i for i, j in zip(nonzero_idx[:-1], nonzero_idx[1:]) if j > i]
+                period_weeks = min(gaps) if gaps else 2
+            else:
+                period_weeks = 2
+            freq_per_year = 52.0 / float(period_weeks)
+
+            # IRR as upfront outlay + inflows
+            irr_cashflow = [-float(principal)] + full_cashflow if full_cashflow else [-float(principal)]
+            annual_irr = None
+            try:
+                if any(c > 0 for c in irr_cashflow[1:]):
+                    periodic_irr = npf.irr(irr_cashflow)
+                    if periodic_irr is not None:
+                        annual_irr = (1.0 + periodic_irr) ** float(freq_per_year) - 1.0
+            except Exception:
+                annual_irr = None
+
+            total_received = float(sum(full_cashflow))
+            cash_on_cash = (total_received / principal) if principal > 0 else 0.0
+            loss_severity = max(0.0, (principal - total_received) / principal) if principal > 0 else 0.0
+
+            results.append({
+                "Tranche": tranche.name,
+                "Principal": round(principal, 2),
+                "Total Received": round(total_received, 2),
+                "Annual IRR (%)": round(annual_irr * 100, 2) if annual_irr is not None else None,
+                "Cash-on-Cash Return (%)": round(cash_on_cash * 100, 2),
+                "Loss Severity (%)": round(loss_severity * 100, 2),
+            })
+            continue
+
         total_received = 0.0
 
         # Collect total payments per week across all units
@@ -158,6 +219,19 @@ def calculate_npv_module(cashflows_df, loans, annual_discount_rates=None, expect
     """
     if annual_discount_rates is None:
         annual_discount_rates = [0.05, 0.10, 0.15]
+
+    # Fallbacks for losses if not supplied by caller
+    if expected_loss is None:
+        expected_loss = _expected_loss_horizon(loans, lgd_assumption=0.70, horizon_weeks=8)
+
+    if realized_loss is None:
+        total_principal_rl = float(sum(getattr(loan, "order_amount", 0.0) for loan in loans))
+        total_received_rl = 0.0
+        for loan in loans:
+            pr = getattr(loan, "payment_record", {}) or {}
+            if isinstance(pr, dict):
+                total_received_rl += float(sum(pr.values()))
+        realized_loss = max(0.0, total_principal_rl - total_received_rl)
 
     # Try to read a cashflow column, fallback to reconstruction from loans
     cash_col = None

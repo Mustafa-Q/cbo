@@ -102,6 +102,8 @@ def assign_correlated_default_times_hybrid(
         loan.default_time_week_continuous = float(t_cont)
         loan.default_week = int(default_week)
 
+        loan.defaulted = True
+
         # For BNPL payment logic: snap to the *next* payment week >= t_cont
         next_pay_weeks = [w for w in due_weeks if w >= t_cont - 1e-9]
         loan.default_scheduled_week_to_pay = int(next_pay_weeks[0]) if next_pay_weeks else None
@@ -185,33 +187,47 @@ class SpecialPurposeVehicle:
         return sum(loan.order_amount for loan in self.loans)
 
     def simulate_all_payments(self, max_weeks: int = 52):
-        week = 1
-        while True:
-            active_loans = 0
-            total_weekly_payment = 0
+        """Simulate loan payments only on due weeks, then aggregate and run the same
+        waterfall used in MC pricing. Persist per-tranche cashflow arrays so
+        investor metrics (IRR/CoC) work for the single SPV path.
+        """
+        due_weeks = (2, 4, 6, 8)
+        self.weeks_run = 0
+
+        # 1) Generate loan-level payments on the due schedule
+        for week in due_weeks:
             for loan in self.loans:
-                if not loan.defaulted:  # modified for DataFrame or row['prepaid']  # modified for DataFrame or row['remaining_balance']  # modified for DataFrame == 0):
-                    payment = loan.simulate_payment(week)
-                    total_weekly_payment += payment
-                    active_loans += 1
+                loan.simulate_payment(week)
+            self.weeks_run = week
 
-            if total_weekly_payment > 0:
-                self.waterfall.apply_payments(total_weekly_payment, week)
+        # 2) Aggregate pool cashflows exactly like MC
+        cashflow_df = aggregate_cashflows_local(self.loans)
 
-            if active_loans == 0 or week > max_weeks:
-                break
-            week += 1
+        # 3) Build a tranche structure (name/principal/rate) from current tranches
+        tranche_structure = [
+            {
+                "name": t.name,
+                "principal": float(getattr(t, "principal", 0.0)),
+                "rate": 0.05 if t.name == "Senior" else (0.08 if t.name == "Mezzanine" else 0.15),
+            }
+            for t in self.tranches
+        ]
 
-        self.weeks_run = week
+        # 4) Run the same waterfall used in MC to get weekly tranche cashflows
+        tranche_cf = simulate_tranche_waterfall(cashflow_df, tranche_structure)
+
+        # 5) Persist per-tranche arrays for downstream IRR/CoC and reporting
+        for t in self.tranches:
+            cf = list(tranche_cf.get(t.name, []))
+            # Store full history so compute_single_run_investor_metrics can read it
+            setattr(t, "cashflows", cf)
+            t.total_received = float(sum(cf))
 
     def get_cashflows_by_week(self) -> Dict[int, float]:
-        cashflows = defaultdict(float)
-        for week in range(2, self.weeks_run + 1, 2):
-            for loan in self.loans:
-                payment = loan.simulate_payment(week)
-                cashflows[week] += payment
-
-            weekly_total_payment = cashflows[week]
+        """Return a {week: cashflow} dict using recorded loan payment_history.
+        Does not call simulate_payment again (avoids double-posting)."""
+        df = aggregate_cashflows_local(self.loans)
+        return {int(w): float(a) for w, a in zip(df["week"].tolist(), df["cashflow"].tolist())}
 
 
 
@@ -336,11 +352,16 @@ def main():
         spv.loans, spv.tranches, spv.reserve, spv.waterfall
     )
 
-    # 8️⃣ Calculate expected and realized loss
-    expected_loss = sum(
-        row["order_amount"] * score_to_default_rate(row["credit_score"])
-        for _, row in loan_df.iterrows()
-    )
+    # 8️⃣ Calculate expected and realized loss (horizon-adjusted PD × LGD over 8 weeks)
+    # Expected loss aligned with valuation/statistics (PD_horizon * LGD over 8 weeks)
+    lgd_assumption = 0.70
+    horizon_years = 8.0 / 52.0
+    expected_loss = 0.0
+    for _, row in loan_df.iterrows():
+        pd_ann = float(score_to_default_rate(row["credit_score"]))
+        pd_ann = max(0.0, min(pd_ann, 1.0))
+        pd_h = 1.0 - (1.0 - pd_ann) ** horizon_years
+        expected_loss += float(row["order_amount"]) * pd_h * lgd_assumption
 
     # Sum up equity payments from waterfall history
     all_cashflows = aggregate_cashflows_local(spv.loans)
