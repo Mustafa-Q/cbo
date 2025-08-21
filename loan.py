@@ -1,4 +1,4 @@
-from copula import score_to_default_rate
+from hazard_models import score_to_default_rate
 import random
 import numpy as np
 from scipy.stats import norm

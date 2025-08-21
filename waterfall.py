@@ -1,5 +1,6 @@
 # Add helper imports after any existing imports (none in this file)
-from copula import generate_correlated_defaults, score_to_default_rate
+from copula import generate_correlated_defaults
+from hazard_models import score_to_default_rate
 
 # ----------------------------
 # Reserve Account Class

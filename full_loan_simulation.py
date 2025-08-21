@@ -16,7 +16,10 @@ from statistics import calculate_summary_statistics, generate_reports, generate_
 from tranche import Tranche, TrancheUnit
 from valuation import compute_expected_tranche_npvs, compute_single_run_investor_metrics, compute_tranche_unit_npvs, calculate_npv_module
 from waterfall import ReserveAccount, Waterfall
-from copula import score_to_default_rate, generate_correlated_defaults
+from copula import generate_correlated_defaults
+from hazard_models import score_to_default_rate
+from hazard_models import cox_hazard_rate
+from credit_state import simulate_credit_transition
 
 import numpy as np
 import numpy_financial as npf
@@ -67,10 +70,9 @@ def assign_correlated_default_times_hybrid(
         raise ValueError("due_hazard_multiplier must be in (0,2) so that p_other remains positive.")
 
     for i, loan in enumerate(loans):
-        # Map score -> annual PD (provided by existing project util)
-        pd_ann = float(score_to_default_rate(getattr(loan, "credit_score", None)))
-        # Convert to horizon PD and then base weekly hazard
-        pd_hor = annual_to_horizon_pd(pd_ann, horizon_years)
+        # Use Cox model for hazard estimation instead of static PD
+        hazard_rate = float(cox_hazard_rate(getattr(loan, "credit_score", None)))
+        pd_hor = annual_to_horizon_pd(hazard_rate, horizon_years)
         p_base = weekly_hazard_from_horizon_pd(pd_hor, horizon_weeks)
 
         # Two-level weekly hazards; clip to a sensible range
@@ -103,6 +105,11 @@ def assign_correlated_default_times_hybrid(
         loan.default_week = int(default_week)
 
         loan.defaulted = True
+
+        # Simulate a credit rating downgrade or transition
+        if hasattr(loan, "credit_state") and loan.credit_state != "D":
+            new_state = simulate_credit_transition(loan.credit_state)
+            loan.credit_state = new_state
 
         # For BNPL payment logic: snap to the *next* payment week >= t_cont
         next_pay_weeks = [w for w in due_weeks if w >= t_cont - 1e-9]

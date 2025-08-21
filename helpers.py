@@ -3,7 +3,8 @@ import pandas as pd
 from collections import defaultdict
 import numpy as np
 from scipy.stats import norm
-from copula import score_to_default_rate, generate_correlated_defaults
+from copula import generate_correlated_defaults
+from hazard_models import score_to_default_rate
 
 
 def project_loan_cashflows(loans, weeks, prepay_rate=0.01):

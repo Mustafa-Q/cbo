@@ -1,4 +1,5 @@
-from copula import generate_correlated_defaults, score_to_default_rate
+from copula import generate_correlated_defaults
+from hazard_models import score_to_default_rate
 from typing import List
 import pandas as pd
 from collections import defaultdict

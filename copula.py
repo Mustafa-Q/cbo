@@ -1,16 +1,47 @@
 import numpy as np
 from scipy.stats import norm
 
+import numpy as np
+from scipy.stats import norm, t as student_t
+
 # ----------------------------
-# Default Probability Helper
+# Gaussian Copula Defaults
 # ----------------------------
-def score_to_default_rate(score: int) -> float:
-    if score > 700:
-        return 0.02  
-    elif score > 650:
-        return 0.03  
-    else:
-        return 0.05  
+def generate_correlated_defaults(n_loans, default_probs, rho=0.2, seed=None):
+    """
+    Generate correlated default flags using a Gaussian copula.
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    corr_matrix = rho * np.ones((n_loans, n_loans)) + (1 - rho) * np.eye(n_loans)
+    L = np.linalg.cholesky(corr_matrix)
+
+    Z_indep = np.random.normal(size=(n_loans,))
+    Z_corr = L @ Z_indep
+
+    thresholds = norm.ppf(default_probs)
+    return Z_corr < thresholds
+
+
+# ----------------------------
+# t-Copula Defaults (Tail Dependence)
+# ----------------------------
+def generate_t_copula_defaults(n_loans, default_probs, rho=0.2, df=3, seed=None):
+    """
+    Generate correlated defaults using a t-copula with tail dependence.
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    corr_matrix = rho * np.ones((n_loans, n_loans)) + (1 - rho) * np.eye(n_loans)
+    L = np.linalg.cholesky(corr_matrix)
+
+    Z_indep = student_t.rvs(df, size=n_loans)
+    Z_corr = L @ Z_indep
+
+    U = student_t.cdf(Z_corr, df)  # Convert to uniforms
+    return U < default_probs
 
 # ----------------------------
 # Correlated Default Generator
@@ -42,3 +73,4 @@ def generate_correlated_defaults(n_loans, default_probs, rho=0.2, seed=None):
     # Determine default based on inverse CDF (quantile function)
     thresholds = norm.ppf(default_probs)
     return Z_corr < thresholds
+
