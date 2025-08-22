@@ -11,7 +11,9 @@ import math
 from copy import deepcopy
 
 from loan import Loan, ValuationLoan
-from helpers import project_loan_cashflows, aggregate_weekly_cashflows, aggregate_cashflows, simulate_tranche_waterfall, print_summary_statistics, assign_correlated_defaults
+from helpers import (project_loan_cashflows, aggregate_weekly_cashflows, aggregate_cashflows, simulate_tranche_waterfall, 
+                    print_summary_statistics, assign_correlated_defaults, export_empirical_data, fit_income_distribution,
+                    fit_default_time_distribution, fit_delay_distribution)
 from statistics import calculate_summary_statistics, generate_reports, generate_security_report
 from tranche import Tranche, TrancheUnit
 from valuation import compute_expected_tranche_npvs, compute_single_run_investor_metrics, compute_tranche_unit_npvs, calculate_npv_module
@@ -25,6 +27,7 @@ import numpy as np
 import numpy_financial as npf
 
 from scipy.stats import norm
+from scipy.stats import lognorm
 
 def annual_to_horizon_pd(pd_annual: float, horizon_years: float) -> float:
     """Convert annual PD to a horizon PD assuming independent hazard over time."""
@@ -261,8 +264,20 @@ def simulate_loans(num_loans=20):
     # Credit scores: Normal distribution clipped to FICO range
     credit_scores = np.random.normal(loc=660, scale=80, size=num_loans).clip(300, 850).round(0)
 
+    empirical_income_data = np.random.lognormal(mean=10.5, sigma=0.5, size=1000)
+
     # Income levels: Normally distributed with bounds
-    incomes = np.random.normal(loc=50000, scale=20000, size=num_loans).clip(10000, 200000).round(0)
+    params = fit_income_distribution(empirical_income_data)
+    incomes = lognorm.rvs(s=params["shape"], scale=params["scale"], size=num_loans)
+    # For demonstration, mock empirical default times and delays if not present
+    empirical_default_times = np.random.exponential(scale=2.0, size=1000)
+    empirical_delays = np.random.poisson(lam=1.0, size=1000)
+    # Sample default times from exponential fit
+    default_params = fit_default_time_distribution(empirical_default_times)
+    default_times = np.random.exponential(scale=default_params["scale"], size=num_loans)
+    # Sample payment delays from Poisson fit
+    delay_params = fit_delay_distribution(empirical_delays)
+    payment_delays = np.random.poisson(lam=delay_params["mu"], size=num_loans)
 
     # Employment status: Categorical distribution
     employment_statuses = np.random.choice(
@@ -285,22 +300,23 @@ def simulate_loans(num_loans=20):
         'credit_score': credit_scores,
         'credit_quality': credit_quality,
         'income': incomes,
-        'employment_status': employment_statuses
+        'employment_status': employment_statuses,
+        'default_time': default_times,
+        'simulated_delay': payment_delays
     })
 
     return df
-
-
 
 
 def main():
     # 1️⃣ Generate loans
     loans_df = simulate_loans()
 
-    valuation_loans = [
-    ValuationLoan(row['loan_id'], row['order_amount'], row['credit_score'])
-        for _, row in loans_df.iterrows()
-    ]
+    valuation_loans = []
+    for _, row in loans_df.iterrows():
+        loan = ValuationLoan(row['loan_id'], row['order_amount'], row['credit_score'])
+        loan.income = row['income']
+        valuation_loans.append(loan)
 
     assign_correlated_default_times_hybrid(valuation_loans, rho=0.7, seed=42, due_hazard_multiplier=1.5)
 
@@ -348,6 +364,8 @@ def main():
 
     # 6️⃣ Run the actual simulation
     spv.simulate_all_payments()
+
+    export_empirical_data(spv.loans)
 
     # ✅ Aggregate all cashflows AFTER the simulation has generated them
     metrics_df = compute_single_run_investor_metrics(spv.tranches)

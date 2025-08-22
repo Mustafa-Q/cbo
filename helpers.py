@@ -2,6 +2,7 @@ from typing import List
 import pandas as pd
 from collections import defaultdict
 import numpy as np
+from scipy import stats
 from scipy.stats import norm
 from copula import generate_correlated_defaults
 from hazard_models import score_to_default_rate
@@ -123,7 +124,6 @@ def print_summary_statistics(stats):
 
 
 
-
 def assign_correlated_defaults(loans, rho=0.2, seed=None):
     """
     Assign correlated default outcomes to each loan using Gaussian copula.
@@ -140,3 +140,31 @@ def assign_correlated_defaults(loans, rho=0.2, seed=None):
     for loan, defaulted in zip(loans, default_flags):
         if defaulted:
             loan.set_default()
+
+
+def export_empirical_data(loans, path="empirical_data.csv"):
+    rows = []
+    for loan in loans:
+        delay_list = getattr(loan, "payment_delays", [])
+        for delay in delay_list:
+            rows.append({
+                "loan_id": loan.loan_id,
+                "income": loan.income,
+                "default_time": loan.default_time_week_continuous,
+                "delay": delay,
+            })
+    df = pd.DataFrame(rows)
+    df.to_csv(path, index=False)
+
+
+def fit_income_distribution(data):
+    shape, loc, scale = stats.lognorm.fit(data, floc=0)
+    return {"distribution": "lognorm", "shape": shape, "scale": scale}
+
+def fit_default_time_distribution(data):
+    loc, scale = stats.expon.fit(data)
+    return {"distribution": "expon", "loc": loc, "scale": scale}
+
+def fit_delay_distribution(data):
+    mu = np.mean(data)
+    return {"distribution": "poisson", "mu": mu}

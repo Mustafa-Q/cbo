@@ -108,6 +108,11 @@ class Loan:
                 self.paid_weeks.append(week)
                 self.payment_record[week] = self.payment_record.get(week, 0.0) + total_due
 
+                if week != due_week:
+                    if not hasattr(self, "payment_delays"):
+                        self.payment_delays = []
+                    self.payment_delays.append(week - due_week)
+
         # Replace with still-due items
         self.due_stack = still_due
 
@@ -199,6 +204,23 @@ class ValuationLoan:
         if self.defaulted or self.prepaid:
             return 0.0
 
+        # Empirical default time override
+        if hasattr(self, "sampled_default_time") and not self.defaulted:
+            sampled_floor = int(np.floor(self.sampled_default_time))
+            if week >= sampled_floor:
+                self.defaulted = True
+                self.default_week = sampled_floor
+                self.default_time_week_continuous = self.sampled_default_time
+                self.default_scheduled_week_to_pay = week
+                # Recovery on default
+                recovery_rate = 0.30
+                recovery_amount = float(self.remaining_balance) * recovery_rate
+                self.remaining_balance = 0.0
+                if recovery_amount > 0.0:
+                    self.cash_collected += recovery_amount
+                    self.payment_record[week] = self.payment_record.get(week, 0.0) + recovery_amount
+                return recovery_amount
+
         # External/default override hook (kept for parity)
         if getattr(self, "externally_defaulted", False):
             # Treat as immediate default with recovery; log into payment_record
@@ -222,6 +244,11 @@ class ValuationLoan:
                 self.cash_collected += recovery_amount
                 self.payment_record[week] = self.payment_record.get(week, 0.0) + recovery_amount
             return recovery_amount
+
+        # Empirical payment delay override
+        if hasattr(self, "sampled_delay") and self.sampled_delay > 0:
+            self.sampled_delay -= 1
+            return 0.0
 
         # Add this week’s scheduled installment obligation
         if week in self.payment_weeks:
@@ -284,6 +311,11 @@ class ValuationLoan:
                 if week not in self.paid_weeks:
                     self.paid_weeks.append(week)
                 self.payment_record[week] = self.payment_record.get(week, 0.0) + total_due
+
+                if week != due_week:
+                    if not hasattr(self, "payment_delays"):
+                        self.payment_delays = []
+                    self.payment_delays.append(week - due_week)
 
         # Replace with still-due items for next weeks
         self.due_stack = still_due
