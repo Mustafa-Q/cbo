@@ -142,19 +142,6 @@ def assign_correlated_defaults(loans, rho=0.2, seed=None):
             loan.set_default()
 
 
-def export_empirical_data(loans, path="empirical_data.csv"):
-    rows = []
-    for loan in loans:
-        delay_list = getattr(loan, "payment_delays", [])
-        for delay in delay_list:
-            rows.append({
-                "loan_id": loan.loan_id,
-                "income": loan.income,
-                "default_time": loan.default_time_week_continuous,
-                "delay": delay,
-            })
-    df = pd.DataFrame(rows)
-    df.to_csv(path, index=False)
 
 
 def fit_income_distribution(data):
