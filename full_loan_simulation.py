@@ -12,7 +12,7 @@ from copy import deepcopy
 
 from loan import Loan, ValuationLoan
 from helpers import (project_loan_cashflows, aggregate_weekly_cashflows, aggregate_cashflows, simulate_tranche_waterfall, 
-                    print_summary_statistics, assign_correlated_defaults, export_empirical_data, fit_income_distribution,
+                    print_summary_statistics, assign_correlated_defaults, fit_income_distribution,
                     fit_default_time_distribution, fit_delay_distribution)
 from statistics import calculate_summary_statistics, generate_reports, generate_security_report
 from tranche import Tranche, TrancheUnit
@@ -365,7 +365,6 @@ def main():
     # 6️⃣ Run the actual simulation
     spv.simulate_all_payments()
 
-    export_empirical_data(spv.loans)
 
     # ✅ Aggregate all cashflows AFTER the simulation has generated them
     metrics_df = compute_single_run_investor_metrics(spv.tranches)
