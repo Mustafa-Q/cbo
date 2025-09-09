@@ -2,8 +2,6 @@
 
 This project simulates and values a short‑dated BNPL securitization. Think of it as a compact, readable lab for structuring and analyzing a pool of Buy Now, Pay Later installments that are packaged into notes (tranches) and paid by a simple waterfall.
 
-The goal here is clarity: what the security is, how cash actually moves, and what this code tries to measure. No heavy math, just the mechanics.
-
 ## What The Security Is
 
 - A short‑maturity, non‑revolving securitization backed by BNPL receivables.
