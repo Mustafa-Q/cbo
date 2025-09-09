@@ -1,33 +1,34 @@
+import argparse
 import random
 from collections import defaultdict
 import pandas as pd
 from typing import List, Dict
-import numpy_financial as npf
 import numpy as np
-
-from typing import List, Dict
-from collections import defaultdict
+import numpy_financial as npf
 import math
 from copy import deepcopy
 
 from loan import Loan, ValuationLoan
-from helpers import (project_loan_cashflows, aggregate_weekly_cashflows, aggregate_cashflows, simulate_tranche_waterfall, 
-                    print_summary_statistics, assign_correlated_defaults, fit_income_distribution,
-                    fit_default_time_distribution, fit_delay_distribution)
+from helpers import (
+    aggregate_cashflows,
+    simulate_tranche_waterfall,
+    assign_correlated_defaults,
+    fit_income_distribution,
+    fit_default_time_distribution,
+    fit_delay_distribution,
+)
 from statistics import calculate_summary_statistics, generate_reports, generate_security_report
-from tranche import Tranche, TrancheUnit
-from valuation import compute_expected_tranche_npvs, compute_single_run_investor_metrics, compute_tranche_unit_npvs, calculate_npv_module
+from tranche import Tranche
+from valuation import (
+    compute_expected_tranche_npvs,
+    compute_single_run_investor_metrics,
+    compute_tranche_unit_npvs,
+    calculate_npv_module,
+)
 from waterfall import ReserveAccount, Waterfall
-from copula import generate_correlated_defaults
-from hazard_models import score_to_default_rate
-from hazard_models import cox_hazard_rate
+from hazard_models import score_to_default_rate, cox_hazard_rate
 from credit_state import simulate_credit_transition
-
-import numpy as np
-import numpy_financial as npf
-
-from scipy.stats import norm
-from scipy.stats import lognorm
+from scipy.stats import norm, lognorm
 
 def annual_to_horizon_pd(pd_annual: float, horizon_years: float) -> float:
     """Convert annual PD to a horizon PD assuming independent hazard over time."""
@@ -151,6 +152,32 @@ def aggregate_cashflows_local(loans, horizon_weeks: int = 8) -> pd.DataFrame:
     df["amount"] = df["cashflow"]
     return df
 
+
+def finalize_unpaid_loans(loans, terminal_week: int = 8, recovery_rate: float = 0.30) -> None:
+    """
+    At the end of the horizon, convert any remaining unpaid balances into a
+    terminal default with immediate recovery. This aligns realized loss with
+    investor cashflows and default rates.
+    """
+    for loan in loans:
+        if getattr(loan, "defaulted", False) or getattr(loan, "prepaid", False):
+            continue
+        remaining = float(getattr(loan, "remaining_balance", 0.0))
+        if remaining > 1e-8:
+            # Post recovery cashflow
+            rec = remaining * float(recovery_rate)
+            if rec > 0:
+                pr = getattr(loan, "payment_record", None)
+                if isinstance(pr, dict):
+                    loan.payment_record[terminal_week] = loan.payment_record.get(terminal_week, 0.0) + rec
+                # Optional accounting
+                if hasattr(loan, "cash_collected"):
+                    loan.cash_collected += rec
+            # Mark default and clear balance
+            loan.defaulted = True
+            loan.default_week = terminal_week
+            loan.remaining_balance = 0.0
+
 def monte_carlo_tranche_npvs(loans_df, tranche_structure, rho=0.07, discount_rates=None, n_paths=200):
     """Price tranches by Monte Carlo using the SAME mechanics as realized path."""
     from helpers import aggregate_cashflows, simulate_tranche_waterfall, assign_correlated_defaults
@@ -174,12 +201,35 @@ def monte_carlo_tranche_npvs(loans_df, tranche_structure, rho=0.07, discount_rat
         for week in [2, 4, 6, 8]:
             for loan in loans:
                 loan.simulate_payment(week)
+        # End-of-horizon default resolution with recovery
+        finalize_unpaid_loans(loans, terminal_week=8, recovery_rate=0.30)
         cashflow_df = aggregate_cashflows_local(loans)
         tranche_cf = simulate_tranche_waterfall(cashflow_df, tranche_structure)
         for name, cf in tranche_cf.items():
             sums[name] += float(npf.npv(discount_rates[name]/52.0, cf))
 
     return {name: sums[name] / n_paths for name in tranche_names}
+
+
+def monte_carlo_expected_pool_loss(loans_df, rho=0.07, n_paths=200) -> float:
+    """Estimate expected pool loss over the horizon using the same mechanics
+    as the realized path, averaged over MC paths.
+    """
+    total_principal = float(loans_df["order_amount"].sum())
+    loss_sum = 0.0
+    for _ in range(n_paths):
+        loans = [
+            ValuationLoan(row['loan_id'], row['order_amount'], row['credit_score'])
+            for _, row in loans_df.iterrows()
+        ]
+        assign_correlated_default_times_hybrid(loans, rho=rho, seed=random.randint(0, 10**9), due_hazard_multiplier=1.5)
+        for week in [2, 4, 6, 8]:
+            for loan in loans:
+                loan.simulate_payment(week)
+        finalize_unpaid_loans(loans, terminal_week=8, recovery_rate=0.30)
+        collected = float(aggregate_cashflows_local(loans)["cashflow"].sum())
+        loss_sum += max(0.0, total_principal - collected)
+    return loss_sum / n_paths
 
 
 # ----------------------------
@@ -210,10 +260,13 @@ class SpecialPurposeVehicle:
                 loan.simulate_payment(week)
             self.weeks_run = week
 
-        # 2) Aggregate pool cashflows exactly like MC
+        # 2) Finalize any unpaid balances at horizon (terminal default + recovery)
+        finalize_unpaid_loans(self.loans, terminal_week=8, recovery_rate=0.30)
+
+        # 3) Aggregate pool cashflows exactly like MC
         cashflow_df = aggregate_cashflows_local(self.loans)
 
-        # 3) Build a tranche structure (name/principal/rate) from current tranches
+        # 4) Build a tranche structure (name/principal/rate) from current tranches
         tranche_structure = [
             {
                 "name": t.name,
@@ -223,14 +276,16 @@ class SpecialPurposeVehicle:
             for t in self.tranches
         ]
 
-        # 4) Run the same waterfall used in MC to get weekly tranche cashflows
+        # 5) Run the same waterfall used in MC to get weekly tranche cashflows
         tranche_cf = simulate_tranche_waterfall(cashflow_df, tranche_structure)
 
-        # 5) Persist per-tranche arrays for downstream IRR/CoC and reporting
+        # 6) Persist per-tranche arrays for downstream IRR/CoC and reporting
+        week_index = cashflow_df["week"].tolist()
         for t in self.tranches:
             cf = list(tranche_cf.get(t.name, []))
             # Store full history so compute_single_run_investor_metrics can read it
             setattr(t, "cashflows", cf)
+            setattr(t, "cashflow_weeks", list(week_index))
             t.total_received = float(sum(cf))
 
     def get_cashflows_by_week(self) -> Dict[int, float]:
@@ -308,9 +363,9 @@ def simulate_loans(num_loans=20):
     return df
 
 
-def main():
+def main(num_loans: int = 200, n_paths: int = 100, rho: float = 0.07, seed: int = 42):
     # 1️⃣ Generate loans
-    loans_df = simulate_loans()
+    loans_df = simulate_loans(num_loans=num_loans)
 
     valuation_loans = []
     for _, row in loans_df.iterrows():
@@ -318,7 +373,7 @@ def main():
         loan.income = row['income']
         valuation_loans.append(loan)
 
-    assign_correlated_default_times_hybrid(valuation_loans, rho=0.7, seed=42, due_hazard_multiplier=1.5)
+    assign_correlated_default_times_hybrid(valuation_loans, rho=rho, seed=seed, due_hazard_multiplier=1.5)
 
     df = pd.DataFrame([{
         "loan_id": row['loan_id'],
@@ -335,12 +390,9 @@ def main():
     ]
     discount_rates = {"Senior": 0.05, "Mezzanine": 0.08, "Equity": 0.15}
 
-    true_npvs = monte_carlo_tranche_npvs(loans_df, tranche_structure, rho=0.07, discount_rates=discount_rates, n_paths=200)
+    true_npvs = monte_carlo_tranche_npvs(loans_df, tranche_structure, rho=rho, discount_rates=discount_rates, n_paths=n_paths)
 
-    print("\n--- True Projected NPVs (Separated Valuation) ---")
-    for t_name, npv in true_npvs.items():
-        print(f"{t_name}: {npv:.2f}")
-
+    # Single MC valuation printout
     tranches = [
         Tranche(name="Senior", principal=tranche_structure[0]["principal"], priority=1),
         Tranche(name="Mezzanine", principal=tranche_structure[1]["principal"], priority=2),
@@ -352,8 +404,8 @@ def main():
     #valuation_loans = [ValuationLoan(row['loan_id'], row['order_amount'], row['credit_score']) 
     #                   for _, row in loans_df.iterrows()]
 
-    projected_npvs = monte_carlo_tranche_npvs(loans_df, tranche_structure, rho=0.07, discount_rates=discount_rates, n_paths=200)
-    print("\n--- Projected Tranche NPVs ---")
+    projected_npvs = true_npvs
+    print("\n--- Projected Tranche NPVs (Monte Carlo) ---")
     for name, npv in projected_npvs.items():
         print(f"{name}: {npv:.2f}")
 
@@ -376,16 +428,8 @@ def main():
         spv.loans, spv.tranches, spv.reserve, spv.waterfall
     )
 
-    # 8️⃣ Calculate expected and realized loss (horizon-adjusted PD × LGD over 8 weeks)
-    # Expected loss aligned with valuation/statistics (PD_horizon * LGD over 8 weeks)
-    lgd_assumption = 0.70
-    horizon_years = 8.0 / 52.0
-    expected_loss = 0.0
-    for _, row in loan_df.iterrows():
-        pd_ann = float(score_to_default_rate(row["credit_score"]))
-        pd_ann = max(0.0, min(pd_ann, 1.0))
-        pd_h = 1.0 - (1.0 - pd_ann) ** horizon_years
-        expected_loss += float(row["order_amount"]) * pd_h * lgd_assumption
+    # 8️⃣ Calculate expected and realized loss using MC mechanics for alignment
+    expected_loss = monte_carlo_expected_pool_loss(df, rho=rho, n_paths=n_paths)
 
     # Sum up equity payments from waterfall history
     all_cashflows = aggregate_cashflows_local(spv.loans)
@@ -415,9 +459,9 @@ def main():
     def print_summary_statistics(stats):
         print("\n====== Loan Portfolio Summary Statistics ======\n")
         
-        print(f"Average Recovery Rate: {stats['average_recovery_rate']:.2%}")
+        print(f"Pool Collection Ratio: {stats['average_recovery_rate']:.2%}")
         print(f"Total Late Fees Collected: ${stats['total_late_fees_collected']:,}")
-        print(f"Average Effective APR: {stats['average_effective_apr']:.2%}\n")
+        print(f"Net Collection Yield (annualized): {stats['average_effective_apr']:.2%}\n")
         
         print("Default Rate by Credit Score Bucket:")
         for bucket, rate in stats['default_rate_by_bucket'].items():
@@ -428,8 +472,7 @@ def main():
     print_summary_statistics(summary_stats)
 
 
-if __name__ == "__main__":
-  main()
+    
 
 
 def run_simulation_summary(num_loans=500, discount_rates=None):
@@ -484,57 +527,34 @@ def run_simulation_summary(num_loans=500, discount_rates=None):
     }
 
 
+def parse_args():
+    p = argparse.ArgumentParser(description="BNPL securitization demo and MC summary")
+    p.add_argument("--num-loans", type=int, default=200, help="Number of loans in the pool")
+    p.add_argument("--n-paths", type=int, default=100, help="Monte Carlo paths for NPV")
+    p.add_argument("--rho", type=float, default=0.07, help="Default correlation (copula rho)")
+    p.add_argument("--seed", type=int, default=42, help="Random seed for default timing")
+    p.add_argument("--summary-runs", type=int, default=0, help="Also run MC summary for given number of runs")
+    return p.parse_args()
+
+
 if __name__ == "__main__":
-    results = []
+    args = parse_args()
+    main(num_loans=args.num_loans, n_paths=args.n_paths, rho=args.rho, seed=args.seed)
+    if args.summary_runs > 0:
+        # Reuse existing helper to produce a compact MC summary
+        results = []
+        for i in range(args.summary_runs):
+            summary = run_simulation_summary(num_loans=args.num_loans)
+            results.append(summary)
 
-    # Simulation loop (Monte Carlo)
-    for i in range(10):
-        summary = run_simulation_summary()
-        results.append(summary)
+        df = pd.DataFrame(results)
+        npv_df = df["npvs_by_tranche"].apply(pd.Series)
+        npv_df.columns = [f"NPV_{col}" for col in npv_df.columns]
+        df = df.drop(columns=["npvs_by_tranche"]).join(npv_df)
+        df = df.round(2)
+        print("\n--- Simulation Summary (runs) ---")
+        summary_df = df.drop(columns=['cashflow_df'], errors='ignore')
+        print(summary_df.to_string(index=False))
 
-    df = pd.DataFrame(results)
 
-    # Flatten npvs_by_tranche dict into separate columns
-    # Converts the dictionary column into separate NPV_Senior, NPV_Mezzanine, etc columns
-    npv_df = df["npvs_by_tranche"].apply(pd.Series)
-    npv_df.columns = [f"NPV_{col}" for col in npv_df.columns]
-
-    # Drop the original messy column and join clean one
-    df = df.drop(columns=["npvs_by_tranche"]).join(npv_df)
-
-    # Round all numerical columns
-    df = df.round(2)
-    print("\n--- Simulation Summary (10 runs) ---")
-    summary_df = df.drop(columns=['cashflow_df'], errors='ignore')
-    print(summary_df.to_string(index=False))
-
-    default_counts = df["num_defaults"]
-    tail_loss_runs = sum(df["total_losses"] > 2000)
-    threshold = 1.0  # treat <= $1 as negligible; tweak as you like
-    paid_runs = int((df["NPV_Equity"] > threshold).sum())
-    zero_runs = len(df) - paid_runs
-
-    print("\n--- Copula Impact Summary ---")
-    print(f"Avg defaults per run: {default_counts.mean():.2f}")
-    print(f"Runs with tail losses > $2000: {tail_loss_runs}/{len(df)}")
-    print(f"Equity paid meaningfully (> ${threshold:.0f}) in {paid_runs}/{len(df)} runs; "f"negligible in {zero_runs}/{len(df)} runs.")
-    print("\n")
-
-    # --- Risk Metrics (MC) ---
-    equity_wipe_threshold = 1.0  # treat <= $1 NPV as wiped; tweak if needed
-
-    # Probability equity is wiped
-    p_equity_wiped = float((df["NPV_Equity"] <= equity_wipe_threshold).mean())
-
-    # Loss percentiles (P50 / P95) and Expected Shortfall at 95%
-    losses = df["total_losses"].to_numpy(dtype=float)
-    p50_loss = float(np.percentile(losses, 50))
-    p95_loss = float(np.percentile(losses, 95))
-    es95_loss = float(losses[losses >= p95_loss].mean()) if (losses >= p95_loss).any() else p95_loss
-
-    print("--- Risk Metrics ---")
-    print(f"P(Equity wiped) (NPV_Equity <= ${equity_wipe_threshold:.0f}): {p_equity_wiped:.2%}")
-    print(f"Portfolio loss P50: ${p50_loss:,.2f}")
-    print(f"Portfolio loss P95: ${p95_loss:,.2f}")
-    print(f"Expected shortfall (>= P95): ${es95_loss:,.2f}")
-    print("\n")
+    

@@ -1,5 +1,5 @@
 from copula import generate_correlated_defaults
-from hazard_models import score_to_default_rate
+from hazard_models import cox_hazard_rate
 from typing import List
 import pandas as pd
 from collections import defaultdict
@@ -15,14 +15,14 @@ def _expected_loss_horizon(loans, lgd_assumption: float = 0.70, horizon_weeks: i
     horizon PDs and a constant LGD assumption consistent with simulation.
     EL = sum(EAD * PD_horizon * LGD).
     """
-    from copula import score_to_default_rate  # local import to avoid cycles
     years = float(horizon_weeks) / 52.0
     total_el = 0.0
     for l in loans:
         ead = float(getattr(l, "order_amount", 0.0))
         cs = getattr(l, "credit_score", None)
         try:
-            pd_ann = float(score_to_default_rate(cs))
+            # Align expected loss PD with simulation hazard model
+            pd_ann = float(cox_hazard_rate(cs))
         except Exception:
             pd_ann = 0.0
         pd_ann = max(0.0, min(pd_ann, 1.0))
@@ -31,14 +31,15 @@ def _expected_loss_horizon(loans, lgd_assumption: float = 0.70, horizon_weeks: i
     return float(total_el)
 
 def compute_expected_tranche_npvs(tranches, reserve, loans: List[ValuationLoan], discount_rate=0.05):
+    """
+    Compute expected tranche NPVs using a simple expectation of loan cashflows.
+    Uses `helpers.project_loan_cashflows` to avoid requiring a per-loan
+    `expected_cashflows()` method.
+    """
+    from helpers import project_loan_cashflows
 
     weeks = [2, 4, 6, 8]
-    expected_cashflows = defaultdict(float)
-
-    for loan in loans:
-        cf = loan.expected_cashflows()
-        for week, amount in cf.items():
-            expected_cashflows[week] += amount
+    expected_cashflows_map = project_loan_cashflows(loans, weeks)
 
     # Clone tranches so we don't mutate originals
     temp_tranches = deepcopy(tranches)
@@ -51,7 +52,7 @@ def compute_expected_tranche_npvs(tranches, reserve, loans: List[ValuationLoan],
     tranche_payment_streams = {tranche.name: [] for tranche in temp_tranches}
 
     for i, week in enumerate(weeks):
-        payment = expected_cashflows[week]
+        payment = expected_cashflows_map.get(week, 0.0)
         tranche_paid = temp_waterfall.apply_payments(payment, week)
 
         for t in temp_tranches:
@@ -84,13 +85,23 @@ def compute_single_run_investor_metrics(tranches):
         if isinstance(cf_attr, (list, tuple)) and any(abs(x) > 1e-12 for x in cf_attr):
             full_cashflow = list(cf_attr)
 
-            # Infer payment frequency (weeks) from nonzero gaps for annualization
-            nonzero_idx = [i for i, a in enumerate(full_cashflow) if abs(a) > 1e-9]
-            if len(nonzero_idx) >= 2:
-                gaps = [j - i for i, j in zip(nonzero_idx[:-1], nonzero_idx[1:]) if j > i]
-                period_weeks = min(gaps) if gaps else 2
+            # Prefer actual week indices if provided on the tranche
+            weeks_attr = getattr(tranche, "cashflow_weeks", None)
+            if isinstance(weeks_attr, (list, tuple)) and len(weeks_attr) == len(full_cashflow):
+                nz = [k for k, a in enumerate(full_cashflow) if abs(a) > 1e-9]
+                if len(nz) >= 2:
+                    week_gaps = [weeks_attr[j] - weeks_attr[i] for i, j in zip(nz[:-1], nz[1:]) if weeks_attr[j] > weeks_attr[i]]
+                    period_weeks = min(week_gaps) if week_gaps else 2
+                else:
+                    period_weeks = 2
             else:
-                period_weeks = 2
+                # Fallback to position gaps; assume biweekly by default for BNPL
+                nonzero_idx = [i for i, a in enumerate(full_cashflow) if abs(a) > 1e-9]
+                if len(nonzero_idx) >= 2:
+                    gaps = [j - i for i, j in zip(nonzero_idx[:-1], nonzero_idx[1:]) if j > i]
+                    period_weeks = 2 if not gaps else max(1, min(gaps))
+                else:
+                    period_weeks = 2
             freq_per_year = 52.0 / float(period_weeks)
 
             # IRR as upfront outlay + inflows

@@ -1,6 +1,4 @@
-# Add helper imports after any existing imports (none in this file)
-from copula import generate_correlated_defaults
-from hazard_models import score_to_default_rate
+# Waterfall and ReserveAccount definitions
 
 # ----------------------------
 # Reserve Account Class
@@ -94,25 +92,3 @@ class Waterfall:
 
         self.history.append(record)
         return record['tranche_payments']
-
-
-# ----------------------------
-# Assign Correlated Defaults Function
-# ----------------------------
-def assign_correlated_defaults(loans, rho=0.2, seed=None):
-    """
-    Assign correlated default outcomes to each loan using Gaussian copula.
-
-    Parameters:
-        loans (list): List of Loan or ValuationLoan objects
-        rho (float): Correlation between loans
-        seed (int or None): Random seed
-    """
-    n_loans = len(loans)
-    default_probs = [score_to_default_rate(loan.credit_score) for loan in loans]
-    default_flags = generate_correlated_defaults(n_loans, default_probs, rho=rho, seed=seed)
-
-    for loan, defaulted in zip(loans, default_flags):
-        if defaulted:
-            loan.set_default()
-

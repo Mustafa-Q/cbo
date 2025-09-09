@@ -1,28 +1,5 @@
 import numpy as np
-from scipy.stats import norm
-
-import numpy as np
 from scipy.stats import norm, t as student_t
-
-# ----------------------------
-# Gaussian Copula Defaults
-# ----------------------------
-def generate_correlated_defaults(n_loans, default_probs, rho=0.2, seed=None):
-    """
-    Generate correlated default flags using a Gaussian copula.
-    """
-    if seed is not None:
-        np.random.seed(seed)
-
-    corr_matrix = rho * np.ones((n_loans, n_loans)) + (1 - rho) * np.eye(n_loans)
-    L = np.linalg.cholesky(corr_matrix)
-
-    Z_indep = np.random.normal(size=(n_loans,))
-    Z_corr = L @ Z_indep
-
-    thresholds = norm.ppf(default_probs)
-    return Z_corr < thresholds
-
 
 # ----------------------------
 # t-Copula Defaults (Tail Dependence)
@@ -73,4 +50,3 @@ def generate_correlated_defaults(n_loans, default_probs, rho=0.2, seed=None):
     # Determine default based on inverse CDF (quantile function)
     thresholds = norm.ppf(default_probs)
     return Z_corr < thresholds
-

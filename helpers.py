@@ -80,8 +80,11 @@ def simulate_tranche_waterfall(cashflow_df, tranche_structure=None):
     outstanding_balances = {tranche["name"]: tranche["principal"] for tranche in tranche_structure}
     rates = {tranche["name"]: tranche["rate"] for tranche in tranche_structure}
 
+    prev_week = 0
     for i, row in cashflow_df.iterrows():
-        available_cash = row["cashflow"]
+        available_cash = float(row["cashflow"]) if "cashflow" in row else float(row["amount"]) if "amount" in row else 0.0
+        current_week = int(row["week"]) if "week" in row else (prev_week + 2)
+        dt_weeks = max(1, current_week - prev_week)
 
         for tranche in tranche_structure:
             name = tranche["name"]
@@ -90,8 +93,8 @@ def simulate_tranche_waterfall(cashflow_df, tranche_structure=None):
             balance = outstanding_balances[name]
             if balance <= 0:
                 continue
-            # Weekly interest payment on OUTSTANDING balance
-            interest_due = balance * (rates[name] / 52)
+            # Accrue interest for the elapsed weeks since last payment row
+            interest_due = balance * (rates[name] * dt_weeks / 52.0)
             interest_paid = min(available_cash, interest_due)
             available_cash -= interest_paid
             weekly_cashflows[name][i] += interest_paid
@@ -104,6 +107,7 @@ def simulate_tranche_waterfall(cashflow_df, tranche_structure=None):
 
         if available_cash > 0:
             weekly_cashflows["Equity"][i] += available_cash
+        prev_week = current_week
 
     return weekly_cashflows
 
