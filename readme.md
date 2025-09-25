@@ -31,7 +31,7 @@ This project simulates and values a short‑dated BNPL securitization with three
 ## Scope
 
 - Short‑dated BNPL; no revolving period, hedging, or complex triggers.
-- Minimal fees beyond what’s needed for cash routing; no tax/legal/accounting modeling.
+- Minimal fees beyond what’s needed for cash routing.
 - Borrower interest not modeled; revenues are late fees and recoveries.
 - Stylized but tunable credit risk and correlation.
 
@@ -55,7 +55,7 @@ This project simulates and values a short‑dated BNPL securitization with three
 ## Files
 
 - `full_loan_simulation.py`: Demo driver and scenario runner.
-- `loan.py`: BNPL payment behavior (schedule, prepay, late fees, default/recovery).
+- `loan.py`: BNPL payment behaviour (schedule, prepay, late fees, default/recovery).
 - `tranche.py`, `waterfall.py`: Tranche definitions and sequential waterfall with reserve.
 - `valuation.py`: Tranche valuation and investor metrics.
 - `copula.py`: Default correlation for stress/risk scenarios.
